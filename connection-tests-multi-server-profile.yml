@@ -1,0 +1,99 @@
+name: Connection Tests - Multi Server Profile
+
+on:
+  workflow_dispatch:
+
+jobs:
+  connection-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-13
+          - windows-2022
+        profile-server:
+          - gha-automator-qa2 (dev-team)
+          - dev-team, qa-team
+
+    runs-on: ${{ matrix.os }}
+    name: "run:${{ matrix.os }}, ps:'${{ matrix.profile-server }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4 # Checkout the code to run tests
+
+      - name: Setup Pritunl Profile
+        id: pritunl-connection
+        uses: ./ # Use `nathanielvarona/pritunl-client-github-action@v1` for your GitHub Action workflow.
+        with:
+          profile-file: ${{ secrets.PRITUNL_PROFILE_FILE_MULTI_SERVER }}
+          profile-server: ${{ matrix.profile-server }}
+
+      # The steps below demonstrate how to verify VPN gateway connectivity, including:
+      # 1. Installing IP Calculator
+      # 2. Pinging the VPN Gateway for reachability (testing VPN connectivity with multiple profile servers if defined)
+      # This is a simple example of how to test VPN gateway connectivity, ensuring a stable and secure connection.
+
+      - name: Install IP Calculator
+        shell: bash
+        run: |
+          # Install IP Calculator
+          # Install IP Calculator based on the runner OS
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get install -qq -o=Dpkg::Use-Pty=0 -y ipcalc
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            brew install -q ipcalc
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            # Retry up to 3 times in case of failure
+            for attempt in $(seq 3); do
+              if curl -sSL "https://raw.githubusercontent.com/kjokjo/ipcalc/0.51/ipcalc" \
+                -o $HOME/bin/ipcalc && chmod +x $HOME/bin/ipcalc; then
+                break
+              else
+                echo "Attempt $attempt failed. Retrying..." && sleep 1
+                # If all retries fail, exit with an error
+                if [ $attempt -eq 3 ]; then
+                  echo "Failed to install ipcalc after 3 attempts." && exit 1
+                fi
+              fi
+            done
+          fi
+          # Validate the IP Calculator Installation
+          echo "ipcalc version $(ipcalc --version)"
+
+      - name: VPN Gateway Reachability Test
+        shell: bash
+        run: |
+          # Set the ping count
+          ping_count_number=5
+
+          # Get the Client IDs
+          profile_server_ids_json='${{ steps.pritunl-connection.outputs.client-ids }}'
+          profile_server_ids_array=()
+
+          # Parse the JSON output from the Pritunl connection step
+          while read -r line; do
+            profile_server_ids_array+=("$line")
+          done < <(echo "$profile_server_ids_json" | jq -c '.[]')
+
+          # Iterate over the profile server IDs
+          for profile_server_item in "${profile_server_ids_array[@]}"; do
+            echo "Pinging '$(echo "$profile_server_item" | jq -r ".name")' Gateway."
+
+            # Extract the profile ID and IP from the JSON object
+            profile_id="$(echo "$profile_server_item" | jq -r ".id")"
+            profile_ip="$(pritunl-client list -j | jq --arg profile_id "$profile_id" '.[] | select(.id == $profile_id)' | jq -r '.client_address')"
+
+            # Calculate the VPN gateway IP using ipcalc
+            vpn_gateway="$(ipcalc $profile_ip | awk 'NR==6{print $2}')"
+
+            # Construct the Ping Flags
+            ping_flags="$([[ "$RUNNER_OS" == "Windows" ]] && echo "-n $ping_count_number" || echo "-c $ping_count_number")"
+
+            # Ping the VPN gateway
+            ping $vpn_gateway $ping_flags
+
+            # Print a new line
+            echo -n -e "\n"
+          done
